@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "qwen_asr.h"
 
 /* Load a WAV file, returns mono float32 samples in [-1,1] at 16kHz.
  * Handles: 16-bit PCM, mono or stereo (mixed to mono).
@@ -29,5 +30,13 @@ float *qwen_read_pcm_stdin(int *out_n_samples);
  * Returns: [128, n_frames] mel spectrogram (caller must free)
  * Note: Returns in [mel_bins, frames] layout for Conv2D compatibility. */
 float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames);
+
+/* Start a reader thread that incrementally fills a live audio buffer from stdin.
+ * Detects WAV vs raw s16le. For WAV, requires 16kHz sample rate.
+ * Returns NULL on error. Caller must call qwen_live_audio_free() when done. */
+qwen_live_audio_t *qwen_live_audio_start_stdin(void);
+
+/* Join reader thread and free all resources. */
+void qwen_live_audio_free(qwen_live_audio_t *la);
 
 #endif /* QWEN_ASR_AUDIO_H */

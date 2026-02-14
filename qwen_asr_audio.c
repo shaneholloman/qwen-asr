@@ -391,3 +391,209 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
     *out_frames = n_frames;
     return mel;
 }
+
+/* ========================================================================
+ * Live Audio: stdin reader thread for incremental streaming
+ * ======================================================================== */
+
+#include <pthread.h>
+
+/* Append n_new float samples to la->samples under mutex + signal condvar. */
+static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_new) {
+    pthread_mutex_lock(&la->mutex);
+    if (la->n_samples + n_new > la->capacity) {
+        int new_cap = la->capacity > 0 ? la->capacity : 32000;
+        while (new_cap < la->n_samples + n_new) new_cap *= 2;
+        float *tmp = (float *)realloc(la->samples, (size_t)new_cap * sizeof(float));
+        if (!tmp) {
+            pthread_mutex_unlock(&la->mutex);
+            return;
+        }
+        la->samples = tmp;
+        la->capacity = new_cap;
+    }
+    memcpy(la->samples + la->n_samples, data, (size_t)n_new * sizeof(float));
+    la->n_samples += n_new;
+    pthread_cond_signal(&la->cond);
+    pthread_mutex_unlock(&la->mutex);
+}
+
+/* Convert a chunk of s16le bytes to float samples and append. */
+static void live_audio_convert_and_append(qwen_live_audio_t *la,
+                                          const uint8_t *buf, size_t n_bytes) {
+    int n_frames = (int)(n_bytes / 2);
+    if (n_frames <= 0) return;
+    float *tmp = (float *)malloc((size_t)n_frames * sizeof(float));
+    if (!tmp) return;
+    const int16_t *src = (const int16_t *)buf;
+    for (int i = 0; i < n_frames; i++) tmp[i] = src[i] / 32768.0f;
+    live_audio_append(la, tmp, n_frames);
+    free(tmp);
+}
+
+typedef struct {
+    qwen_live_audio_t *la;
+    int is_wav;
+    int data_remaining;  /* bytes remaining in WAV data chunk, -1 if raw */
+} live_reader_ctx_t;
+
+static void *live_reader_thread(void *arg) {
+    live_reader_ctx_t *rctx = (live_reader_ctx_t *)arg;
+    qwen_live_audio_t *la = rctx->la;
+    int is_wav = rctx->is_wav;
+    int data_remaining = rctx->data_remaining;
+    free(rctx);
+
+    /* Read stdin in ~2s chunks: 32000 samples * 2 bytes = 64000 bytes */
+    const size_t READ_SIZE = 64000;
+    uint8_t *buf = (uint8_t *)malloc(READ_SIZE);
+    if (!buf) {
+        pthread_mutex_lock(&la->mutex);
+        la->eof = 1;
+        pthread_cond_signal(&la->cond);
+        pthread_mutex_unlock(&la->mutex);
+        return NULL;
+    }
+
+    while (1) {
+        size_t want = READ_SIZE;
+        if (is_wav && data_remaining >= 0) {
+            if (data_remaining == 0) break;
+            if (want > (size_t)data_remaining) want = (size_t)data_remaining;
+        }
+        size_t n = fread(buf, 1, want, stdin);
+        if (n == 0) break;
+        if (is_wav && data_remaining >= 0) data_remaining -= (int)n;
+        live_audio_convert_and_append(la, buf, n);
+    }
+
+    free(buf);
+    pthread_mutex_lock(&la->mutex);
+    la->eof = 1;
+    pthread_cond_signal(&la->cond);
+    pthread_mutex_unlock(&la->mutex);
+    return NULL;
+}
+
+qwen_live_audio_t *qwen_live_audio_start_stdin(void) {
+    /* Read enough to detect WAV vs raw: we need at least 12 bytes for RIFF+WAVE,
+     * but a full WAV header is typically 44 bytes. Read up to 4096 to cover
+     * any extended header chunks before the data chunk. */
+    uint8_t header[4096];
+    size_t hdr_read = fread(header, 1, sizeof(header), stdin);
+    if (hdr_read < 4) {
+        fprintf(stderr, "qwen_live_audio_start_stdin: no data on stdin\n");
+        return NULL;
+    }
+
+    int is_wav = 0;
+    int wav_sample_rate = 0;
+    int wav_channels = 0;
+    int wav_bits = 0;
+    int wav_format = 0;
+    int data_chunk_size = -1;
+    size_t data_chunk_offset = 0; /* offset into header[] where PCM data starts */
+    size_t pcm_in_header = 0;     /* how many PCM bytes are in the header buffer */
+
+    if (hdr_read >= 44 && memcmp(header, "RIFF", 4) == 0 && memcmp(header + 8, "WAVE", 4) == 0) {
+        is_wav = 1;
+        /* Parse WAV chunks */
+        const uint8_t *p = header + 12;
+        const uint8_t *end = header + hdr_read;
+        while (p + 8 <= end) {
+            uint32_t chunk_size = read_u32(p + 4);
+            if (memcmp(p, "fmt ", 4) == 0 && chunk_size >= 16) {
+                wav_format = read_u16(p + 8);
+                wav_channels = read_u16(p + 10);
+                wav_sample_rate = read_u32(p + 12);
+                wav_bits = read_u16(p + 22);
+            } else if (memcmp(p, "data", 4) == 0) {
+                data_chunk_size = (int)chunk_size;
+                data_chunk_offset = (size_t)(p + 8 - header);
+                pcm_in_header = hdr_read - data_chunk_offset;
+                if (pcm_in_header > (size_t)data_chunk_size)
+                    pcm_in_header = (size_t)data_chunk_size;
+                break; /* data chunk found, start streaming */
+            }
+            p += 8 + chunk_size;
+            if (chunk_size & 1) p++;
+        }
+
+        if (wav_format != 1 || wav_bits != 16 || wav_channels < 1) {
+            fprintf(stderr, "qwen_live_audio_start_stdin: unsupported WAV format "
+                    "(need 16-bit PCM, got fmt=%d bits=%d)\n", wav_format, wav_bits);
+            return NULL;
+        }
+        if (wav_sample_rate != SAMPLE_RATE) {
+            fprintf(stderr, "qwen_live_audio_start_stdin: WAV sample rate is %d Hz, "
+                    "but live streaming requires 16000 Hz.\n"
+                    "  Hint: pipe through ffmpeg first:\n"
+                    "    ... | ffmpeg -i pipe:0 -ar 16000 -ac 1 -f s16le pipe:1 | "
+                    "./qwen_asr --stdin --stream\n", wav_sample_rate);
+            return NULL;
+        }
+        if (wav_channels != 1) {
+            fprintf(stderr, "qwen_live_audio_start_stdin: WAV has %d channels, "
+                    "but live streaming requires mono.\n"
+                    "  Hint: pipe through ffmpeg first:\n"
+                    "    ... | ffmpeg -i pipe:0 -ar 16000 -ac 1 -f s16le pipe:1 | "
+                    "./qwen_asr --stdin --stream\n", wav_channels);
+            return NULL;
+        }
+        if (data_chunk_offset == 0) {
+            fprintf(stderr, "qwen_live_audio_start_stdin: WAV data chunk not found in header\n");
+            return NULL;
+        }
+        if (qwen_verbose >= 2)
+            fprintf(stderr, "Live stdin: WAV detected (%d Hz, %d-bit, %d ch, data=%d bytes)\n",
+                    wav_sample_rate, wav_bits, wav_channels, data_chunk_size);
+    } else {
+        if (qwen_verbose >= 2)
+            fprintf(stderr, "Live stdin: treating as raw s16le 16kHz mono\n");
+    }
+
+    /* Allocate live audio context */
+    qwen_live_audio_t *la = (qwen_live_audio_t *)calloc(1, sizeof(qwen_live_audio_t));
+    if (!la) return NULL;
+    pthread_mutex_init(&la->mutex, NULL);
+    pthread_cond_init(&la->cond, NULL);
+
+    /* Convert and append any PCM data already read in the header buffer */
+    if (is_wav && pcm_in_header > 0) {
+        live_audio_convert_and_append(la, header + data_chunk_offset, pcm_in_header);
+    } else if (!is_wav) {
+        /* Raw: everything we read is PCM data */
+        live_audio_convert_and_append(la, header, hdr_read);
+    }
+
+    /* Spawn reader thread */
+    live_reader_ctx_t *rctx = (live_reader_ctx_t *)malloc(sizeof(live_reader_ctx_t));
+    if (!rctx) {
+        qwen_live_audio_free(la);
+        return NULL;
+    }
+    rctx->la = la;
+    rctx->is_wav = is_wav;
+    rctx->data_remaining = is_wav ? (data_chunk_size - (int)pcm_in_header) : -1;
+
+    if (pthread_create(&la->thread, NULL, live_reader_thread, rctx) != 0) {
+        fprintf(stderr, "qwen_live_audio_start_stdin: failed to create reader thread\n");
+        free(rctx);
+        qwen_live_audio_free(la);
+        return NULL;
+    }
+
+    return la;
+}
+
+void qwen_live_audio_free(qwen_live_audio_t *la) {
+    if (!la) return;
+    /* If thread was started, wait for it to finish */
+    if (la->thread) {
+        pthread_join(la->thread, NULL);
+    }
+    pthread_mutex_destroy(&la->mutex);
+    pthread_cond_destroy(&la->cond);
+    free(la->samples);
+    free(la);
+}

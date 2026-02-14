@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
 
 /* ========================================================================
  * Constants
@@ -242,6 +243,21 @@ typedef struct {
 } qwen_ctx_t;
 
 /* ========================================================================
+ * Live Audio (incremental stdin streaming)
+ * ======================================================================== */
+
+typedef struct {
+    /* Written by reader thread under mutex */
+    float *samples;
+    int n_samples;
+    int capacity;
+    int eof;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t thread;
+} qwen_live_audio_t;
+
+/* ========================================================================
  * API Functions
  * ======================================================================== */
 
@@ -279,6 +295,11 @@ char *qwen_transcribe_stdin(qwen_ctx_t *ctx);
  * Re-encodes growing audio and uses previous text as decoder context.
  * Tokens are emitted via the token callback as they become "fixed". */
 char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_samples);
+
+/* Live streaming transcription from an incrementally-filled audio source.
+ * The streaming loop waits for new data instead of terminating at EOF.
+ * Tokens are emitted via the token callback as they become "fixed". */
+char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
 
 /* ========================================================================
  * Internal Functions

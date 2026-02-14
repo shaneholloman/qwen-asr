@@ -1098,7 +1098,11 @@ typedef struct {
  *   ([cached windows] + [current partial window]).
  * ======================================================================== */
 
-char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_samples) {
+/* Internal streaming implementation. When live!=NULL, audio is read
+ * incrementally from the live buffer; when NULL, samples/n_samples
+ * provide the complete audio upfront. */
+static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
+                          qwen_live_audio_t *live) {
     const qwen_config_t *cfg = &ctx->config;
     int dim = cfg->dec_hidden;
     int chunk_samples = (int)(ctx->stream_chunk_sec * QWEN_SAMPLE_RATE);
@@ -1109,7 +1113,7 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
     const float *audio_samples = samples;
     int audio_n_samples = n_samples;
     float *compacted_samples = NULL;
-    if (ctx->skip_silence) {
+    if (!live && ctx->skip_silence) {
         compacted_samples = compact_silence(samples, n_samples, &audio_n_samples);
         if (compacted_samples) audio_samples = compacted_samples;
         if (qwen_verbose >= 1) {
@@ -1122,9 +1126,34 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
         }
     }
 
+    /* For live mode, we maintain our own growing copy of the samples. */
+    float *local_samples = NULL;
+    int local_n_samples = 0;
+    int local_capacity = 0;
+    int live_eof = 0;
+
+    if (live) {
+        /* Seed local buffer with whatever is available now. */
+        pthread_mutex_lock(&live->mutex);
+        local_n_samples = live->n_samples;
+        live_eof = live->eof;
+        pthread_mutex_unlock(&live->mutex);
+        if (local_n_samples > 0) {
+            local_capacity = local_n_samples + chunk_samples * 4;
+            local_samples = (float *)malloc((size_t)local_capacity * sizeof(float));
+            if (!local_samples) return NULL;
+            pthread_mutex_lock(&live->mutex);
+            if (live->n_samples < local_n_samples) local_n_samples = live->n_samples;
+            memcpy(local_samples, live->samples, (size_t)local_n_samples * sizeof(float));
+            pthread_mutex_unlock(&live->mutex);
+        }
+        audio_samples = local_samples;
+        audio_n_samples = local_n_samples;
+    }
+
     ctx->perf_total_ms = 0;
     ctx->perf_text_tokens = 0;
-    ctx->perf_audio_ms = 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;
+    ctx->perf_audio_ms = live ? 0.0 : 1000.0 * (double)n_samples / (double)QWEN_SAMPLE_RATE;
     ctx->perf_encode_ms = 0;
     ctx->perf_decode_ms = 0;
     int enc_window_frames = ctx->config.enc_n_window_infer;
@@ -1137,16 +1166,27 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
         use_enc_cache = 0;
     }
 
-    if (qwen_verbose >= 2)
-        fprintf(stderr,
-                "Streaming: %d samples (%.1f s), chunk=%.1f s, rollback=%d, "
-                "unfixed=%d, max_new=%d, enc_window=%.1fs, enc_cache=%s, prefix=%s\n",
-                audio_n_samples, (float)audio_n_samples / QWEN_SAMPLE_RATE,
-                ctx->stream_chunk_sec, rollback,
-                unfixed_chunks, max_new_tokens,
-                (float)enc_window_frames / 100.0f,
-                use_enc_cache ? "on" : "off",
-                ctx->past_text_conditioning ? "on" : "off");
+    if (qwen_verbose >= 2) {
+        if (live)
+            fprintf(stderr,
+                    "Streaming (live): chunk=%.1f s, rollback=%d, "
+                    "unfixed=%d, max_new=%d, enc_window=%.1fs, enc_cache=%s, prefix=%s\n",
+                    ctx->stream_chunk_sec, rollback,
+                    unfixed_chunks, max_new_tokens,
+                    (float)enc_window_frames / 100.0f,
+                    use_enc_cache ? "on" : "off",
+                    ctx->past_text_conditioning ? "on" : "off");
+        else
+            fprintf(stderr,
+                    "Streaming: %d samples (%.1f s), chunk=%.1f s, rollback=%d, "
+                    "unfixed=%d, max_new=%d, enc_window=%.1fs, enc_cache=%s, prefix=%s\n",
+                    audio_n_samples, (float)audio_n_samples / QWEN_SAMPLE_RATE,
+                    ctx->stream_chunk_sec, rollback,
+                    unfixed_chunks, max_new_tokens,
+                    (float)enc_window_frames / 100.0f,
+                    use_enc_cache ? "on" : "off",
+                    ctx->past_text_conditioning ? "on" : "off");
+    }
 
     /* Load tokenizer */
     char vocab_path[1024];
@@ -1162,10 +1202,11 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
         return NULL;
     }
 
-    /* In non-interactive mode (no token callback), streaming chunks are not
-     * externally consumed and the final answer is already produced by a full
-     * refinement pass. Skip chunk-by-chunk decoding entirely. */
-    if (!ctx->token_cb) {
+    /* In non-interactive mode (no token callback) with pre-loaded audio,
+     * streaming chunks are not externally consumed and the final answer is
+     * already produced by a full refinement pass. Skip chunk-by-chunk
+     * decoding entirely. (In live mode we must still use the chunked loop.) */
+    if (!ctx->token_cb && !live) {
         if (qwen_verbose >= 2) {
             fprintf(stderr, "Streaming: no token callback, using direct final refinement\n");
         }
@@ -1222,11 +1263,46 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
     int prefill_total_tokens = 0;
     int prefill_reused_tokens = 0;
 
-    while (audio_cursor < audio_n_samples) {
+    while (audio_cursor < audio_n_samples || (live && !live_eof)) {
+        /* Live mode: wait until we have enough data for the next chunk. */
+        if (live) {
+            int want = audio_cursor + chunk_samples;
+            pthread_mutex_lock(&live->mutex);
+            while (live->n_samples < want && !live->eof)
+                pthread_cond_wait(&live->cond, &live->mutex);
+            int new_n = live->n_samples;
+            int is_eof_now = live->eof;
+            /* Grow local buffer and copy delta. */
+            if (new_n > local_n_samples) {
+                if (new_n > local_capacity) {
+                    int new_cap = local_capacity > 0 ? local_capacity : 32000;
+                    while (new_cap < new_n) new_cap *= 2;
+                    float *tmp = (float *)realloc(local_samples,
+                                                  (size_t)new_cap * sizeof(float));
+                    if (tmp) {
+                        local_samples = tmp;
+                        local_capacity = new_cap;
+                    }
+                }
+                if (local_capacity >= new_n) {
+                    memcpy(local_samples + local_n_samples,
+                           live->samples + local_n_samples,
+                           (size_t)(new_n - local_n_samples) * sizeof(float));
+                    local_n_samples = new_n;
+                }
+            }
+            live_eof = is_eof_now;
+            pthread_mutex_unlock(&live->mutex);
+            audio_samples = local_samples;
+            audio_n_samples = local_n_samples;
+            ctx->perf_audio_ms = 1000.0 * (double)audio_n_samples / (double)QWEN_SAMPLE_RATE;
+        }
+
         double chunk_t0 = get_time_ms();
         audio_cursor += chunk_samples;
         if (audio_cursor > audio_n_samples) audio_cursor = audio_n_samples;
-        int is_final = (audio_cursor >= audio_n_samples);
+        int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)
+                            : (audio_cursor >= audio_n_samples);
 
         /* Encoder path:
          * - default: cache completed local-attention windows and re-encode only
@@ -1637,6 +1713,7 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
     free(stable_text_tokens);
     qwen_tokenizer_free(tokenizer);
     free(compacted_samples);
+    free(local_samples);
 
     /* Trim whitespace */
     size_t rlen = strlen(result);
@@ -1646,6 +1723,14 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
     if (start != result) memmove(result, start, strlen(start) + 1);
 
     return result;
+}
+
+char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_samples) {
+    return stream_impl(ctx, samples, n_samples, NULL);
+}
+
+char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live) {
+    return stream_impl(ctx, NULL, 0, live);
 }
 
 char *qwen_transcribe(qwen_ctx_t *ctx, const char *wav_path) {

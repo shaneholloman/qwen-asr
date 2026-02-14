@@ -5,6 +5,7 @@
  */
 
 #include "qwen_asr.h"
+#include "qwen_asr_audio.h"
 #include "qwen_asr_kernels.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -202,17 +203,17 @@ int main(int argc, char **argv) {
 
     /* Transcribe */
     char *text = NULL;
-    if (stream_mode) {
-        /* Load audio first, then stream-transcribe */
-        int ns = 0;
-        float *samps = NULL;
-        if (use_stdin) {
-            extern float *qwen_read_pcm_stdin(int *);
-            samps = qwen_read_pcm_stdin(&ns);
-        } else {
-            extern float *qwen_load_wav(const char *, int *);
-            samps = qwen_load_wav(input_wav, &ns);
+    if (stream_mode && use_stdin) {
+        /* Live incremental streaming from stdin */
+        qwen_live_audio_t *live = qwen_live_audio_start_stdin();
+        if (live) {
+            text = qwen_transcribe_stream_live(ctx, live);
+            qwen_live_audio_free(live);
         }
+    } else if (stream_mode) {
+        /* File-based streaming: load audio fully, then stream-transcribe */
+        int ns = 0;
+        float *samps = qwen_load_wav(input_wav, &ns);
         if (samps) {
             text = qwen_transcribe_stream(ctx, samps, ns);
             free(samps);
