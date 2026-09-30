@@ -6,6 +6,9 @@
  */
 
 #include "qwen_asr.h"
+#ifdef USE_ROCM
+#include "qwen_asr_rocm.h"
+#endif
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
@@ -230,8 +233,14 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
         return NULL;
     }
 
-    /* Default transcription mode: full-audio offline decode (no splitting). */
+#ifdef USE_ROCM
+    if (qwen_rocm_init(ctx) != 0) { qwen_free(ctx); return NULL; }
+    /* Bound GPU attention and workspace for long recordings. */
+    ctx->segment_sec = 20.0f;
+#else
+    /* Preserve the CPU default: full-audio offline decode (no splitting). */
     ctx->segment_sec = 0.0f;
+#endif
     ctx->search_sec = 3.0f;
 
     /* Default streaming parameters */
@@ -252,6 +261,10 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
 
 void qwen_free(qwen_ctx_t *ctx) {
     if (!ctx) return;
+
+#ifdef USE_ROCM
+    qwen_rocm_free(ctx);
+#endif
 
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 

@@ -1,12 +1,12 @@
 # Qwen3-ASR Pure C Implementation
 
-This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). It has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
+This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). The CPU build has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). An optional **ROCm backend accelerates inference on AMD GPUs** using HIP kernels and rocBLAS; build it with `make rocm` (see [ROCm / AMD GPUs](#rocm--amd-gpus)). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
 
 **Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature.
 
 ## Supported modes and models
 
-Both normal (offline) and streaming (online) modes are supported. Normal mode defaults to full offline decode (`-S 0`), so the whole audio is encoded at once. Streaming mode processes audio in 2-second chunks with prefix rollback (it keeps the last few decoded tokens as context for the decoder/LLM when transcribing the next chunk).
+Both normal (offline) and streaming (online) modes are supported. The CPU build defaults to full offline decode (`-S 0`), so the whole audio is encoded at once. The ROCm build defaults to 20-second segments (`-S 20`) to bound GPU attention and memory use; `-S 0` explicitly enables full-audio decode. Streaming mode processes audio in 2-second chunks with prefix rollback (it keeps the last few decoded tokens as context for the decoder/LLM when transcribing the next chunk).
 
 *Important practical note*: in this implementation, interactive `--stream` prioritizes incremental token stability over throughput and can be much slower than normal mode when you process an already-recorded file end-to-end.
 
@@ -36,7 +36,8 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 
 ## Features
 
-- **Almost zero dependencies**: Pure C implementation. Only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
+- **Almost zero dependencies**: The CPU implementation only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
+- **AMD GPU acceleration**: Optional ROCm backend with HIP kernels, rocBLAS, Q8 decoding, and HIP graphs. Tested on Strix Halo (Radeon 8060S, `gfx1151`).
 - **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
 - **Streaming mode**: `--stream` processes audio in chunks with prefix rollback. A sliding window bounds encoder and decoder context for indefinite streaming.
@@ -44,7 +45,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Language control**: `--language Italian` forces the target language (otherwise it is usually auto-detected).
 - **Prompt biasing**: `--prompt` injects a system prompt to bias the model toward specific terms or spellings. Note that prompt biasing is very soft. The models may or may not care about your instructions. Usually spelling instructions are followed decently.
 - **Optional silence skipping**: `--skip-silence` drops long silent spans before inference (off by default). It may use less CPU for the same file.
-- **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors files — loading is near-instant.
+- **Memory-mapped weights**: CPU inference accesses decoder BF16 weights directly from safetensors files. ROCm converts and uploads weights at load time.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
@@ -57,7 +58,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 ./qwen_asr -d qwen3-asr-0.6b -i recording.wav
 ```
 
-This is the default mode, and defaults to `-S 0` (full-audio offline decode).
+The CPU binary defaults to `-S 0` (full-audio offline decode); the ROCm binary defaults to `-S 20`.
 The model sees the entire recording in one shot, which is usually best for short/medium files.
 For long files, memory/time grow with sequence length, so segmented mode (`-S 20` or similar) is often preferable.
 
@@ -77,7 +78,7 @@ For very long files, decoder cost still grows with sequence history. Use `--stre
 
 ### Which Mode To Use (By File Length)
 
-- **Up to ~60s**: use `-S 0` (which is the default) for best quality if speed is acceptable.
+- **Up to ~60s**: try `-S 0` (the CPU default) if full-context quality and speed are acceptable. Prefer `-S 20` if full-context decoding produces empty or incomplete output.
 - **Large prerecorded files**: use segmented offline mode, e.g. `-S 20` (or `-S 30`, or even more).
 - **Long live/continuous audio or low-latency UI needs**: use `--stream`.
 - **Batch/offline file transcription**: prefer `-S 20`/`-S 30`; it is usually much faster than interactive `--stream`.
@@ -374,12 +375,15 @@ Per sample, the tool reports two distances:
 
 ```bash
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
+make rocm       # AMD GPU acceleration (Linux, HIP + rocBLAS)
 make test       # Run regression checks (requires built binary + model files)
 make test-stream-cache  # Check stream cache on/off equivalence
+make test-rocm  # ROCm kernel checks, no model files needed
+make test-rocm-asr  # ROCm transcription checks, needs qwen3-asr-0.6b
 make clean      # Clean build artifacts
 ```
 
-For Linux, install OpenBLAS first:
+For the Linux CPU build, install OpenBLAS first:
 ```bash
 # Ubuntu/Debian
 sudo apt install libopenblas-dev
@@ -387,6 +391,86 @@ sudo apt install libopenblas-dev
 # Fedora
 sudo dnf install openblas-devel
 ```
+
+### ROCm / AMD GPUs
+
+The ROCm backend uses the same C model loader, tokenizer, audio preprocessing,
+segmentation, streaming code, and model files as the CPU backend. Encoder and
+decoder computation runs on the GPU through HIP C++ kernels and rocBLAS.
+There is no Python inference runtime or OpenBLAS dependency for this build.
+
+It has been tested on Linux with **ROCm 7.1 and Radeon 8060S / Strix Halo
+(`gfx1151`)**. The kernels require a wave32 GPU; wave64 devices are rejected.
+Other wave32 AMD GPUs need the appropriate `GPU_ARCH` and validation on that
+hardware. This is not a claim of support for every ROCm device.
+
+Install a working ROCm environment with `hipcc`, HIP headers/runtime, and
+rocBLAS, and ensure your user can access the GPU device (normally through the
+`render` group). Then:
+
+```bash
+make rocm -j8
+./download_model.sh --model large  # skip if the model is already downloaded
+./qwen_asr_rocm -d qwen3-asr-1.7b -i samples/jfk.wav
+
+# Same stdin and streaming interface as the CPU binary
+ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
+    ./qwen_asr_rocm -d qwen3-asr-1.7b --stdin
+./qwen_asr_rocm -d qwen3-asr-0.6b -i audio.wav --stream
+```
+
+`make rocm` builds **`qwen_asr_rocm`**, leaving the CPU `qwen_asr` binary intact.
+ROCm objects live under `build/rocm/<architecture>/`, separate from CPU objects.
+Build settings can be overridden, for example:
+
+```bash
+make rocm ROCM_PATH=/opt/rocm GPU_ARCH=gfx1151
+# HIPCC, HIPFLAGS, and ROCM_CFLAGS can also be overridden.
+```
+
+The ROCm default is `-S 20`, which bounds attention and workspace for long
+recordings. Use `-S 0` for full-audio decoding. As with the CPU build,
+`--stream --silent` on a file runs final refinement instead of incremental
+streaming. Normal transcription emits tokens immediately to stdout; diagnostics
+go to stderr and `--silent` suppresses them.
+
+**Precision:** `--precision q8` is the default. Token-by-token decoder matrix
+operations use weights quantized to signed 8-bit integers, with one FP32 scale
+per 32 weights. Encoder and batched decoder prefill operations use FP16 weights;
+accumulation, activations, normalization, attention, and KV caches use FP32.
+Both FP16 and Q8 weight copies are retained, so Q8 saves decoding bandwidth
+rather than total weight memory. Use `--precision fp16` to disable Q8 decoding
+for comparison. Neither mode guarantees identical greedy output to the CPU
+backend on every recording.
+
+HIP graphs reduce the launch overhead of each generated token. For debugging,
+`QWEN_ROCM_GRAPHS=0` uses direct kernel launches, and `QWEN_ROCM_Q8=0` selects
+FP16 decoding. An explicit `--precision` overrides the Q8 environment setting.
+
+No background process is started: each CLI invocation loads its model and
+releases its CPU/GPU allocations on exit. For 20-second segmentation on Strix
+Halo, the 1.7B Q8 implementation used about **6 GiB of GPU allocations**, plus
+1.3 GiB of CPU allocations and roughly 4 GiB of reclaimable mapped file pages
+after warmup. CPU and GPU share RAM on this host. Longer full-context inputs
+need additional workspace.
+
+Validate the backend on a ROCm host:
+
+```bash
+make test-rocm
+make test-rocm-asr ROCM_MODEL_DIR=qwen3-asr-0.6b
+./asr_regression.py --stream-cache-check-only \
+    --binary ./qwen_asr_rocm --stream-cache-model-dir qwen3-asr-0.6b
+```
+
+Kernel tests compare against independent scalar calculations and exercise
+attention masks, cache offsets, and KV growth with graph invalidation.
+Transcription checks cover file/stdin input, both precisions, graph replay,
+language forcing, segmentation, and incremental streaming.
+
+The wave32 GEMV and normalization/RoPE kernels adapt techniques from
+[ds4.c](https://github.com/antirez/ds4); its MIT notice is retained in
+[rocm/LICENSE.ds4](rocm/LICENSE.ds4).
 
 ## How Fast Is It?
 
@@ -448,7 +532,10 @@ WAV -> 16kHz -> Mel Spectrogram -> Conv2D Stem -> Encoder -> Projection -> Decod
 | Weight format | BF16 | BF16 |
 | Supported languages | 30 (see `--language`) |
 
-## Memory Requirements
+## CPU Memory Requirements
+
+These measurements describe the CPU backend. See [ROCm / AMD GPUs](#rocm--amd-gpus)
+for the GPU backend's allocation behavior.
 
 Memory usage has two parts:
 - Static model footprint (allocated once at load time).
@@ -508,4 +595,4 @@ In practice:
 
 ## License
 
-MIT
+MIT. See also [rocm/LICENSE.ds4](rocm/LICENSE.ds4) for the adapted ROCm kernels.

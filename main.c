@@ -46,15 +46,27 @@ static int parse_past_text_mode(const char *s, int *out_mode) {
 }
 
 static void usage(const char *prog) {
+#ifdef USE_ROCM
+    fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (C + ROCm/HIP)\n\n");
+#else
     fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (pure C)\n\n");
+#endif
     fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d <dir>      Model directory (with *.safetensors, vocab.json)\n");
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  --list-languages           Print supported languages and exit\n");
+#ifdef USE_ROCM
+    fprintf(stderr, "  --precision <q8|fp16>      Decoder weights (default: q8)\n");
+#endif
     fprintf(stderr, "  -t <n>        Number of threads (default: all CPUs)\n");
+#ifdef USE_ROCM
+    fprintf(stderr, "  -S <secs>     Segment target seconds (default: 20; 0 = full-audio decode)\n");
+#else
     fprintf(stderr, "  -S <secs>     Segment target seconds (default: 0 = full-audio decode)\n");
+#endif
     fprintf(stderr, "  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)\n");
     fprintf(stderr, "  --stream      Streaming mode: process in chunks with prefix rollback\n");
     fprintf(stderr, "  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)\n");
@@ -78,7 +90,7 @@ int main(int argc, char **argv) {
     int verbosity = 1;
     int use_stdin = 0;
     int n_threads = 0; /* 0 = auto-detect */
-    float segment_sec = -1; /* -1 = use default (0) */
+    float segment_sec = -1; /* -1 = use backend default */
     float search_sec = -1;  /* -1 = use default (3) */
     int stream_mode = 0;
     int stream_max_new_tokens = -1; /* -1 = use default (32) */
@@ -94,6 +106,25 @@ int main(int argc, char **argv) {
             model_dir = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             input_wav = argv[++i];
+        } else if (strcmp(argv[i], "--list-languages") == 0) {
+            puts(qwen_supported_languages_csv());
+            return 0;
+        } else if (strcmp(argv[i], "--precision") == 0) {
+            if (i + 1 >= argc ||
+                (strcmp(argv[i + 1], "fp16") && strcmp(argv[i + 1], "q8"))) {
+                fprintf(stderr, "Error: --precision requires q8 or fp16\n");
+                return 1;
+            }
+#ifdef USE_ROCM
+            const char *value = argv[++i];
+            if (setenv("QWEN_ROCM_Q8", strcmp(value, "q8") == 0 ? "1" : "0", 1) != 0) {
+                perror("Cannot set ROCm precision");
+                return 1;
+            }
+#else
+            fprintf(stderr, "Error: --precision requires make rocm (./qwen_asr_rocm)\n");
+            return 1;
+#endif
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             n_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-S") == 0 && i + 1 < argc) {

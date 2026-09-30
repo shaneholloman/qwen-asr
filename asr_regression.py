@@ -399,7 +399,7 @@ def run_stream_cache_once(
         "-i", str(wav),
         "--stream",
         "--enc-window-sec", f"{enc_window_sec:g}",
-        "--silent",
+        "--debug",  # Keep a token callback: --silent bypasses streaming.
     ]
     env = os.environ.copy()
     if cache_on:
@@ -418,7 +418,12 @@ def run_stream_cache_once(
         env=env,
     )
     elapsed = time.monotonic() - t0
-    return cp.returncode, cp.stdout.strip(), cp.stderr.strip(), elapsed
+    rc = cp.returncode
+    err = cp.stderr.strip()
+    if rc == 0 and (err.count("  Commit:") < 2 or "direct final refinement" in err):
+        rc = 1
+        err = "Streaming loop was not exercised\n" + err
+    return rc, cp.stdout.strip(), err, elapsed
 
 
 def run_stream_cache_regression(

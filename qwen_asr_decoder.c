@@ -92,6 +92,7 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
             return -1;
         }
 
+        #ifndef USE_ROCM
         /* Fuse gate+up weights: interleave rows [gate_row0, up_row0, gate_row1, up_row1, ...] */
         {
             int inter = cfg->dec_intermediate;
@@ -106,6 +107,7 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
             }
         }
 
+        #endif
     }
 
     /* Final RMSNorm */
@@ -119,6 +121,7 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
  * KV Cache Management
  * ======================================================================== */
 
+#ifndef USE_ROCM
 static int kv_cache_init(qwen_ctx_t *ctx, int max_seq) {
     int kv_dim = ctx->config.dec_kv_heads * ctx->config.dec_head_dim;
     size_t cache_size = (size_t)ctx->config.dec_layers * max_seq * kv_dim * sizeof(float);
@@ -474,3 +477,5 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
     qwen_rms_norm(x, x, dec->norm, 1, dim, eps);
     return qwen_argmax_matvec_bf16(x, dec->tok_embeddings_bf16, dim, cfg->vocab_size);
 }
+
+#endif /* !USE_ROCM */
