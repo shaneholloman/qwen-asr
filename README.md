@@ -1,12 +1,12 @@
 # Qwen3-ASR Pure C Implementation
 
-This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). The CPU build has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). An optional **ROCm backend accelerates inference on AMD GPUs** using HIP kernels and rocBLAS; build it with `make rocm` (see [ROCm / AMD GPUs](#rocm--amd-gpus)). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
+This is a C implementation of the inference pipeline for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) speech-to-text models (both 0.6B and 1.7B). The CPU build has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Optional GPU backends accelerate inference on **AMD GPUs with ROCm** (`make rocm`) and **NVIDIA GPUs with CUDA** (`make cuda`). See [ROCm / AMD GPUs](#rocm--amd-gpus) and [CUDA / NVIDIA GPUs](#cuda--nvidia-gpus). Tokens stream to stdout as they are generated. The implementation runs at speed multiple of the file length even in very modest hardware, like low end Intel or AMD processor.
 
 **Important**: this implementation explicitly **avoids implementing support for MPS**. Transcription systems are very important pieces of infrastructure, and are often run on remote Linux servers. Adding the MPS target would focus the efforts too much on Apple hardware, so for now I'm skipping it. The code runs very well anyway on Apple hardware (NEON optimized). Please, **don't send pull requests** about this feature, fork the code instead, in order to add MPS support. I'll add it much later when the other optimizations are already mature.
 
 ## Supported modes and models
 
-Both normal (offline) and streaming (online) modes are supported. The CPU build defaults to full offline decode (`-S 0`), so the whole audio is encoded at once. The ROCm build defaults to 20-second segments (`-S 20`) to bound GPU attention and memory use; `-S 0` explicitly enables full-audio decode. Streaming mode processes audio in 2-second chunks with prefix rollback (it keeps the last few decoded tokens as context for the decoder/LLM when transcribing the next chunk).
+Both normal (offline) and streaming (online) modes are supported. The CPU build defaults to full offline decode (`-S 0`), so the whole audio is encoded at once. The ROCm and CUDA builds default to 20-second segments (`-S 20`) to bound GPU attention and memory use; `-S 0` explicitly enables full-audio decode. Streaming mode processes audio in 2-second chunks with prefix rollback (it keeps the last few decoded tokens as context for the decoder/LLM when transcribing the next chunk).
 
 *Important practical note*: in this implementation, interactive `--stream` prioritizes incremental token stability over throughput and can be much slower than normal mode when you process an already-recorded file end-to-end.
 
@@ -37,6 +37,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 ## Features
 
 - **Almost zero dependencies**: The CPU implementation only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
+- **NVIDIA GPU acceleration**: Native CUDA kernels, cuBLAS, Q8 decoding, and CUDA graphs. Tested on DGX Spark (GB10, `sm_121`).
 - **AMD GPU acceleration**: Optional ROCm backend with HIP kernels, rocBLAS, Q8 decoding, and HIP graphs. Tested on Strix Halo (Radeon 8060S, `gfx1151`).
 - **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
@@ -45,7 +46,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Language control**: `--language Italian` forces the target language (otherwise it is usually auto-detected).
 - **Prompt biasing**: `--prompt` injects a system prompt to bias the model toward specific terms or spellings. Note that prompt biasing is very soft. The models may or may not care about your instructions. Usually spelling instructions are followed decently.
 - **Optional silence skipping**: `--skip-silence` drops long silent spans before inference (off by default). It may use less CPU for the same file.
-- **Memory-mapped weights**: CPU inference accesses decoder BF16 weights directly from safetensors files. ROCm converts and uploads weights at load time.
+- **Memory-mapped weights**: CPU inference accesses decoder BF16 weights directly from safetensors files. GPU backends convert and upload weights at load time.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
@@ -58,7 +59,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 ./qwen_asr -d qwen3-asr-0.6b -i recording.wav
 ```
 
-The CPU binary defaults to `-S 0` (full-audio offline decode); the ROCm binary defaults to `-S 20`.
+The CPU binary defaults to `-S 0` (full-audio offline decode); the GPU binaries default to `-S 20`.
 The model sees the entire recording in one shot, which is usually best for short/medium files.
 For long files, memory/time grow with sequence length, so segmented mode (`-S 20` or similar) is often preferable.
 
@@ -376,10 +377,13 @@ Per sample, the tool reports two distances:
 ```bash
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
 make rocm       # AMD GPU acceleration (Linux, HIP + rocBLAS)
+make cuda       # NVIDIA GPU acceleration (CUDA + cuBLAS, DGX Spark by default)
 make test       # Run regression checks (requires built binary + model files)
 make test-stream-cache  # Check stream cache on/off equivalence
 make test-rocm  # ROCm kernel checks, no model files needed
 make test-rocm-asr  # ROCm transcription checks, needs qwen3-asr-0.6b
+make test-cuda  # CUDA kernel checks, no model files needed
+make test-cuda-asr  # CUDA transcription checks, needs qwen3-asr-0.6b
 make clean      # Clean build artifacts
 ```
 
@@ -472,6 +476,106 @@ The wave32 GEMV and normalization/RoPE kernels adapt techniques from
 [ds4.c](https://github.com/antirez/ds4); its MIT notice is retained in
 [rocm/LICENSE.ds4](rocm/LICENSE.ds4).
 
+### CUDA / NVIDIA GPUs
+
+The native CUDA backend runs the encoder and decoder on NVIDIA GPUs using
+CUDA C++ kernels and cuBLAS. It shares the C model loader, tokenizer, audio
+preprocessing, segmentation, and streaming implementation with the CPU and
+ROCm builds. It uses the same unmodified safetensors models; Python, PyTorch,
+cuDNN, and HIP are not needed for inference.
+
+The default target is **DGX Spark / NVIDIA GB10 (`sm_121`)**, tested on Linux
+AArch64 with CUDA Toolkit 13.0. Install the CUDA toolkit and a compatible driver,
+then build and run:
+
+```bash
+make cuda -j8
+./download_model.sh --model large  # skip if already downloaded
+./qwen_asr_cuda -d qwen3-asr-1.7b -i samples/jfk.wav
+
+# Both models, stdin, and streaming use the existing interface
+./qwen_asr_cuda -d qwen3-asr-0.6b -i audio.wav --stream
+ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
+    ./qwen_asr_cuda -d qwen3-asr-1.7b --stdin
+```
+
+`make cuda` produces **`qwen_asr_cuda`**, independently of the CPU and ROCm
+binaries. CUDA objects are stored in `build/cuda/<architecture>/`. The toolkit
+path, compiler, flags, and GPU architecture can be overridden:
+
+```bash
+make cuda CUDA_PATH=/usr/local/cuda CUDA_ARCH=sm_121
+# NVCC, NVCCFLAGS, and CUDA_CFLAGS can also be overridden.
+```
+
+For another NVIDIA GPU, set `CUDA_ARCH` to its architecture and run the tests
+below; other devices have not been validated here. DGX Spark requires a toolkit
+that supports `sm_121`, such as CUDA 13.0. NVIDIA's
+[Spark porting guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/compilation.html)
+describes the platform's compilation requirements.
+
+Like ROCm, CUDA defaults to **20-second segments** (`-S 20`) and **Q8 decoding**
+(`--precision q8`). Use `-S 0` for full-audio decoding, or `--precision fp16`
+for an unquantized decoder comparison. Q8 stores decoder weights as signed
+8-bit values with an FP32 scale per 32 weights. Batched matrix operations use
+FP16 weights with FP32 accumulation; activations, attention, and KV caches stay
+FP32. Both weight formats are retained in Q8 mode, so the benefit is lower
+bandwidth during token generation, not a smaller total weight allocation.
+GPU weights alone occupy about 2.08 GiB for 0.6B and 5.60 GiB for 1.7B in Q8
+mode; working buffers, runtime allocations, CPU weights, and mapped model
+files add to that. DGX Spark uses shared CPU/GPU system memory.
+
+CUDA graphs replay the single-token decoder. Set `QWEN_CUDA_GRAPHS=0` to use
+direct launches for comparison, or `QWEN_CUDA_Q8=0` for FP16 decoding. An
+explicit `--precision` overrides the Q8 environment setting. Use
+`CUDA_VISIBLE_DEVICES` to select a GPU. The CLI loads a model for each run and
+releases its allocations on exit; it does not install or start a resident
+service.
+
+Validate kernels and transcription on the CUDA host:
+
+```bash
+make test-cuda
+make test-cuda-asr CUDA_MODEL_DIR=qwen3-asr-0.6b
+make test-cuda-asr CUDA_MODEL_DIR=qwen3-asr-1.7b
+./asr_regression.py --stream-cache-check-only \
+    --binary ./qwen_asr_cuda --stream-cache-model-dir qwen3-asr-0.6b
+
+# Optional NVIDIA memory and synchronization checks
+/usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 1 \
+    ./build/cuda/sm_121/kernel-test
+/usr/local/cuda/bin/compute-sanitizer --tool racecheck --error-exitcode 1 \
+    ./build/cuda/sm_121/kernel-test
+/usr/local/cuda/bin/compute-sanitizer --tool synccheck --error-exitcode 1 \
+    ./build/cuda/sm_121/kernel-test
+```
+
+On the tested Spark (driver 580.173.02, CUDA 13.0), Q8 transcription times
+were as follows. These are medians of three runs after one warmup, with the
+model already loaded, using 20-second segments and eight CPU threads. They
+exclude model loading and WAV reading:
+
+| Recording | Duration | 0.6B | 1.7B |
+| --- | ---: | ---: | ---: |
+| JFK | 11.0 s | 0.264 s | 0.452 s |
+| Short test speech | 3.64 s | 0.159 s | 0.278 s |
+| Don't be afraid of me | 45.0 s | 0.626 s | 0.986 s |
+| Another broadcast | 119.3 s | 2.498 s | 4.402 s |
+
+**Fresh-process latency is higher:** the 11-second JFK clip took a median
+2.44 seconds with 0.6B and 6.01 seconds with 1.7B across three CLI invocations,
+including model loading and process teardown, with files cached by the OS.
+The CLI retains the load-per-invocation behavior.
+
+Both precisions matched the CPU reference's normalized transcripts on 24
+FLEURS recordings across eight languages (Arabic, Chinese, German, Spanish,
+French, Italian, Japanese, and Russian). This is a small regression set, not
+an accuracy benchmark representative of all supported languages.
+
+The CUDA kernels are ported from this project's ROCm backend, with native CUDA
+warp synchronization and cuBLAS calls. The original ds4.c attribution also
+applies; see [rocm/LICENSE.ds4](rocm/LICENSE.ds4).
+
 ## How Fast Is It?
 
 Benchmarks were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
@@ -535,7 +639,7 @@ WAV -> 16kHz -> Mel Spectrogram -> Conv2D Stem -> Encoder -> Projection -> Decod
 ## CPU Memory Requirements
 
 These measurements describe the CPU backend. See [ROCm / AMD GPUs](#rocm--amd-gpus)
-for the GPU backend's allocation behavior.
+and [CUDA / NVIDIA GPUs](#cuda--nvidia-gpus) for GPU allocation behavior.
 
 Memory usage has two parts:
 - Static model footprint (allocated once at load time).

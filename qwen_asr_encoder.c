@@ -168,7 +168,7 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
  * Forward Pass
  * ======================================================================== */
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_CUDA)
 float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
                              int *out_seq_len) {
     const qwen_config_t *cfg = &ctx->config;
@@ -372,4 +372,4 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
     return enc_output;
 }
 
-#endif /* !USE_ROCM */
+#endif /* CPU backend */

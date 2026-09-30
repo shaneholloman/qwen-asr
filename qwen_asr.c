@@ -9,6 +9,9 @@
 #ifdef USE_ROCM
 #include "qwen_asr_rocm.h"
 #endif
+#ifdef USE_CUDA
+#include "qwen_asr_cuda.h"
+#endif
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_safetensors.h"
 #include "qwen_asr_audio.h"
@@ -235,6 +238,10 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
 
 #ifdef USE_ROCM
     if (qwen_rocm_init(ctx) != 0) { qwen_free(ctx); return NULL; }
+#elif defined(USE_CUDA)
+    if (qwen_cuda_init(ctx) != 0) { qwen_free(ctx); return NULL; }
+#endif
+#if defined(USE_ROCM) || defined(USE_CUDA)
     /* Bound GPU attention and workspace for long recordings. */
     ctx->segment_sec = 20.0f;
 #else
@@ -264,6 +271,8 @@ void qwen_free(qwen_ctx_t *ctx) {
 
 #ifdef USE_ROCM
     qwen_rocm_free(ctx);
+#elif defined(USE_CUDA)
+    qwen_cuda_free(ctx);
 #endif
 
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)

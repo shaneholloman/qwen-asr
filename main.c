@@ -48,6 +48,8 @@ static int parse_past_text_mode(const char *s, int *out_mode) {
 static void usage(const char *prog) {
 #ifdef USE_ROCM
     fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (C + ROCm/HIP)\n\n");
+#elif defined(USE_CUDA)
+    fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (C + CUDA)\n\n");
 #else
     fprintf(stderr, "qwen_asr — Qwen3-ASR speech-to-text (pure C)\n\n");
 #endif
@@ -58,11 +60,11 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --list-languages           Print supported languages and exit\n");
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_CUDA)
     fprintf(stderr, "  --precision <q8|fp16>      Decoder weights (default: q8)\n");
 #endif
     fprintf(stderr, "  -t <n>        Number of threads (default: all CPUs)\n");
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_CUDA)
     fprintf(stderr, "  -S <secs>     Segment target seconds (default: 20; 0 = full-audio decode)\n");
 #else
     fprintf(stderr, "  -S <secs>     Segment target seconds (default: 0 = full-audio decode)\n");
@@ -115,14 +117,19 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: --precision requires q8 or fp16\n");
                 return 1;
             }
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_CUDA)
             const char *value = argv[++i];
-            if (setenv("QWEN_ROCM_Q8", strcmp(value, "q8") == 0 ? "1" : "0", 1) != 0) {
-                perror("Cannot set ROCm precision");
+#ifdef USE_CUDA
+            const char *precision_env = "QWEN_CUDA_Q8";
+#else
+            const char *precision_env = "QWEN_ROCM_Q8";
+#endif
+            if (setenv(precision_env, strcmp(value, "q8") == 0 ? "1" : "0", 1) != 0) {
+                perror("Cannot set GPU precision");
                 return 1;
             }
 #else
-            fprintf(stderr, "Error: --precision requires make rocm (./qwen_asr_rocm)\n");
+            fprintf(stderr, "Error: --precision requires make rocm or make cuda\n");
             return 1;
 #endif
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {

@@ -177,6 +177,7 @@ typedef void (*qwen_token_cb)(const char *piece, void *userdata);
 
 typedef struct {
     void *rocm; /* Per-context HIP weights, workspace, KV cache and graphs. */
+    void *cuda; /* Per-context CUDA weights, workspace, KV cache and graphs. */
     qwen_config_t config;
     qwen_encoder_t encoder;
     qwen_decoder_t decoder;
@@ -214,7 +215,7 @@ typedef struct {
     void *token_cb_userdata;
 
     /* Segmentation settings */
-    float segment_sec;             /* 0 = no splitting, default CPU: 0, ROCm: 20 seconds */
+    float segment_sec;             /* 0 = no splitting, default CPU: 0, GPU: 20 seconds */
     float search_sec;              /* segment-cutting silence search window ± seconds (default 3) */
 
     /* Streaming settings */

@@ -8,8 +8,8 @@ Pure C inference engine for Qwen3-ASR speech-to-text models:
 - `Qwen3-ASR-0.6B`
 - `Qwen3-ASR-1.7B`
 
-CPU inference uses BLAS and architecture-specific SIMD paths. The optional ROCm
-backend runs encoder/decoder computation on the GPU, sharing the C
+CPU inference uses BLAS and architecture-specific SIMD paths. Optional ROCm
+and CUDA backends run encoder/decoder computation on the GPU, sharing the C
 loader, tokenizer, audio preprocessing, segmentation, and streaming code.
 
 ## Source Of Truth
@@ -102,7 +102,9 @@ From `qwen_load()` and CLI:
   - architecture dispatch macros
 - `qwen_asr_rocm.hip`, `rocm/kernels.h`
   - HIP/rocBLAS backend, tested on wave32 Strix Halo (`gfx1151`)
-- `tests/rocm/`
+- `qwen_asr_cuda.cu`, `cuda/kernels.cuh`
+  - CUDA/cuBLAS backend, tested on DGX Spark (`sm_121`)
+- `tests/rocm/`, `tests/cuda/`
   - independent kernel checks and CLI transcription smoke tests
 - `asr_regression.py`
   - quality + focused regression checks
@@ -116,9 +118,9 @@ Build:
 make blas
 ```
 
-The GPU build uses `make rocm`, producing `qwen_asr_rocm`. CPU and ROCm
-have separate objects and binaries. CPU builds must continue to work
-without the GPU toolkit installed. See README.md
+GPU builds use `make rocm` or `make cuda`, producing `qwen_asr_rocm` and
+`qwen_asr_cuda`. Each backend has separate objects and binaries. CPU builds
+must continue to work without either GPU toolkit installed. See README.md
 for dependencies, architecture overrides, precision, and graph controls.
 
 Smoke run:
@@ -165,6 +167,9 @@ GPU checks (run on the corresponding GPU host):
 make test-rocm
 make test-rocm-asr ROCM_MODEL_DIR=qwen3-asr-0.6b
 make test-rocm-asr ROCM_MODEL_DIR=qwen3-asr-1.7b
+make test-cuda
+make test-cuda-asr CUDA_MODEL_DIR=qwen3-asr-0.6b
+make test-cuda-asr CUDA_MODEL_DIR=qwen3-asr-1.7b
 ```
 Run the focused stream-cache check above with the appropriate GPU binary too.
 `make test` continues to test the CPU binary; GPU smoke tests cover both

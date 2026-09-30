@@ -28,10 +28,24 @@ ROCM_TARGET = qwen_asr_rocm
 ROCM_TEST = $(ROCM_BUILD)/kernel-test
 ROCM_MODEL_DIR ?= qwen3-asr-0.6b
 
+# Native CUDA backend. sm_121 is the GB10 GPU in DGX Spark.
+CUDA_PATH ?= /usr/local/cuda
+NVCC ?= $(CUDA_PATH)/bin/nvcc
+CUDA_ARCH ?= sm_121
+CUDA_CFLAGS ?= -Wall -Wextra -O3 -march=native
+NVCCFLAGS ?= -O3 -std=c++17 -lineinfo
+CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64 -Xlinker=-rpath,$(CUDA_PATH)/lib64 -lcublas -lm -lpthread
+CUDA_BUILD = build/cuda/$(CUDA_ARCH)
+CUDA_OBJS = $(SRCS:%.c=$(CUDA_BUILD)/%.o)
+CUDA_TARGET = qwen_asr_cuda
+CUDA_TEST = $(CUDA_BUILD)/kernel-test
+CUDA_MODEL_DIR ?= qwen3-asr-0.6b
+
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
 .PHONY: all clean clean-cpu clean-rocm debug info help blas rocm test test-stream-cache test-rocm test-rocm-asr FORCE
+.PHONY: cuda clean-cuda test-cuda test-cuda-asr
 
 # Default: show available targets
 all: help
@@ -42,6 +56,7 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
 	@echo "  make rocm     - AMD GPU acceleration (HIP/rocBLAS; builds qwen_asr_rocm)"
+	@echo "  make cuda     - NVIDIA GPU acceleration (CUDA/cuBLAS; builds qwen_asr_cuda)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug    - Debug build with AddressSanitizer"
@@ -49,6 +64,8 @@ help:
 	@echo "  make test-stream-cache - Run stream cache on/off equivalence check"
 	@echo "  make test-rocm - Run ROCm kernel tests (no model needed)"
 	@echo "  make test-rocm-asr - Run ROCm transcription checks (needs 0.6B model)"
+	@echo "  make test-cuda - Run CUDA kernel tests (no model needed)"
+	@echo "  make test-cuda-asr - Run CUDA transcription checks (needs 0.6B model)"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make info     - Show build configuration"
 	@echo ""
@@ -113,6 +130,44 @@ test-rocm-asr: $(ROCM_TARGET)
 -include $(ROCM_OBJS:.o=.d) $(ROCM_BUILD)/main.d
 
 # =============================================================================
+# Backend: cuda (native CUDA kernels + cuBLAS, tested on DGX Spark / sm_121)
+# =============================================================================
+cuda: $(CUDA_TARGET)
+
+$(CUDA_TARGET): $(CUDA_BUILD)/qwen_asr_cuda FORCE
+	cp $< $@
+
+$(CUDA_BUILD)/qwen_asr_cuda: $(CUDA_OBJS) $(CUDA_BUILD)/main.o $(CUDA_BUILD)/qwen_asr_cuda.o
+	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -o $@ $^ $(CUDA_LDFLAGS)
+
+$(CUDA_BUILD)/%.o: %.c
+	@mkdir -p $(@D)
+	$(CC) $(CUDA_CFLAGS) -DUSE_CUDA -MMD -MP -c $< -o $@
+
+$(CUDA_BUILD)/qwen_asr_cuda.o: qwen_asr_cuda.cu qwen_asr_cuda.h qwen_asr.h cuda/kernels.cuh
+	@mkdir -p $(@D)
+	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -DUSE_CUDA -c $< -o $@
+
+$(CUDA_BUILD)/qwen_asr_cuda_test.o: qwen_asr_cuda.cu qwen_asr_cuda.h qwen_asr.h cuda/kernels.cuh tests/cuda/selftest.h
+	@mkdir -p $(@D)
+	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -DUSE_CUDA -DQWEN_CUDA_TEST -c $< -o $@
+
+$(CUDA_BUILD)/kernel_test.o: tests/cuda/kernel_test.c qwen_asr_cuda.h qwen_asr.h
+	@mkdir -p $(@D)
+	$(CC) $(CUDA_CFLAGS) -DUSE_CUDA -I. -c $< -o $@
+
+$(CUDA_TEST): $(CUDA_OBJS) $(CUDA_BUILD)/kernel_test.o $(CUDA_BUILD)/qwen_asr_cuda_test.o
+	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -o $@ $^ $(CUDA_LDFLAGS)
+
+test-cuda: $(CUDA_TEST)
+	./$(CUDA_TEST)
+
+test-cuda-asr: $(CUDA_TARGET)
+	python3 tests/cuda/smoke.py --binary ./$(CUDA_TARGET) --model "$(CUDA_MODEL_DIR)"
+
+-include $(CUDA_OBJS:.o=.d) $(CUDA_BUILD)/main.d
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -131,7 +186,7 @@ debug:
 # =============================================================================
 # Utilities
 # =============================================================================
-clean: clean-cpu clean-rocm
+clean: clean-cpu clean-rocm clean-cuda
 
 clean-cpu:
 	rm -f $(OBJS) main.o $(TARGET)
@@ -140,11 +195,17 @@ clean-rocm:
 	rm -rf build/rocm
 	rm -f $(ROCM_TARGET)
 
+clean-cuda:
+	rm -rf build/cuda
+	rm -f $(CUDA_TARGET)
+
 info:
 	@echo "Platform: $(UNAME_S)"
 	@echo "Compiler: $(CC)"
 	@echo "ROCm compiler: $(HIPCC)"
 	@echo "ROCm architecture: $(GPU_ARCH)"
+	@echo "CUDA compiler: $(NVCC)"
+	@echo "CUDA architecture: $(CUDA_ARCH)"
 	@echo ""
 ifeq ($(UNAME_S),Darwin)
 	@echo "Backend: blas (Apple Accelerate)"
